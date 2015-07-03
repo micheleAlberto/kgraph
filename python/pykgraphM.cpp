@@ -12,6 +12,29 @@
 using namespace std;
 namespace python = boost::python;
 
+typedef const unsigned long long chunk_t;
+const static int chunk_size = sizeof(chunk_t);
+
+
+struct hamming {
+        static float apply (uint8_t const *t1, uint8_t const *t2, unsigned dim) {
+        int total = 0;
+        size_t bufsize=sizeof(uint8_t)*dim;
+        const long num_chunks = bufsize / chunk_size;
+        const size_t chunked_bufsize = num_chunks * chunk_size;
+        const int leftover = bufsize - chunked_bufsize;
+        for (long i = 0; i < num_chunks; i++)
+            {   
+                chunk_t chunk_1 = *reinterpret_cast<chunk_t *>(t1 + i * chunk_size);
+                chunk_t chunk_2 = *reinterpret_cast<chunk_t *>(t2 + i * chunk_size);
+                chunk_t chunk_xor = chunk_1 ^ chunk_2;
+                total += __builtin_popcountll(chunk_xor);
+            };
+        return total;
+        }   
+    };  
+
+
 class KGraph {
     kgraph::KGraph *index;
     bool hasIndex;
@@ -41,6 +64,15 @@ class KGraph {
         index->build(oracle, params, NULL);
         hasIndex = true;
     }
+    //template <>
+    void buildImpl__uint8_t_ (python::object const &data,
+                               kgraph::KGraph::IndexParams params) {
+        checkArray<uint8_t>(data);
+        kgraph::MatrixProxy<uint8_t> dmatrix(reinterpret_cast<PyArrayObject *>(data.ptr()));
+        kgraph::MatrixOracle<uint8_t, hamming> oracle(dmatrix);
+        index->build(oracle, params, NULL);
+        hasIndex = true;
+    }
 
     template <typename TYPE>
     python::object searchImpl (python::object const &data,
@@ -56,16 +88,47 @@ class KGraph {
         PyObject *result =  PyArray_SimpleNew(2, dims, NPY_UINT32);
         kgraph::MatrixProxy<unsigned, 1> rmatrix(reinterpret_cast<PyArrayObject *>(result));
 #ifdef _OPENMP
-        if (threads) ::omp_set_max_threads(threads);
+        if (threads) ::omp_set_num_threads(threads);
 #endif
         if (hasIndex) {
-#pragma omp parallel for reduction(+:cost)
+#pragma omp parallel for 
             for (unsigned i = 0; i < qmatrix.size(); ++i) {
                 index->search(oracle.query(qmatrix[i]), params, const_cast<unsigned *>(rmatrix[i]), NULL);
             }
         }
         else {
-#pragma omp parallel for reduction(+:cost)
+#pragma omp parallel for 
+            for (unsigned i = 0; i < qmatrix.size(); ++i) {
+                oracle.query(qmatrix[i]).search(params.K, params.epsilon, const_cast<unsigned *>(rmatrix[i]));
+            }
+        }
+        return python::object(python::handle<>(result));
+    }
+
+
+    python::object searchImpl__uint8_t_  (python::object const &data,
+                               python::object const &query,
+                               kgraph::KGraph::SearchParams params,
+                               unsigned threads) {
+        checkArray<uint8_t>(data);
+        checkArray<uint8_t>(query);
+        kgraph::MatrixProxy<uint8_t> dmatrix(reinterpret_cast<PyArrayObject *>(data.ptr()));
+        kgraph::MatrixProxy<uint8_t> qmatrix(reinterpret_cast<PyArrayObject *>(query.ptr()));
+        kgraph::MatrixOracle<uint8_t, hamming > oracle(dmatrix);
+        npy_intp dims[] = {qmatrix.size(), params.K};
+        PyObject *result =  PyArray_SimpleNew(2, dims, NPY_UINT32);
+        kgraph::MatrixProxy<unsigned, 1> rmatrix(reinterpret_cast<PyArrayObject *>(result));
+#ifdef _OPENMP
+        if (threads) ::omp_set_num_threads(threads);
+#endif
+        if (hasIndex) {
+#pragma omp parallel for 
+            for (unsigned i = 0; i < qmatrix.size(); ++i) {
+                index->search(oracle.query(qmatrix[i]), params, const_cast<unsigned *>(rmatrix[i]), NULL);
+            }
+        }
+        else {
+#pragma omp parallel for 
             for (unsigned i = 0; i < qmatrix.size(); ++i) {
                 oracle.query(qmatrix[i]).search(params.K, params.epsilon, const_cast<unsigned *>(rmatrix[i]));
             }
@@ -109,6 +172,7 @@ public:
         switch (pd->descr->type_num) {
             case NPY_FLOAT: buildImpl<float>(data, params); return;
             case NPY_DOUBLE: buildImpl<double>(data, params); return;
+            case NPY_UINT8: buildImpl__uint8_t_(data, params); return;
         }
         throw runtime_error("data type not supported.");
     }
@@ -130,6 +194,7 @@ public:
         switch (pd->descr->type_num) {
             case NPY_FLOAT: return searchImpl<float>(data, query, params, threads);
             case NPY_DOUBLE: return searchImpl<double>(data, query, params, threads);
+            case NPY_UINT8: return searchImpl__uint8_t_(data, query, params, threads);
         }
         throw runtime_error("data type not supported.");
         return python::object();
